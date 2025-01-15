@@ -1,8 +1,105 @@
 // Copyright 2024 the Xilem Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! An experimental Rust native UI framework.
+//! `Xilem` is a UI toolkit. It combines ideas from `Flutter`, `SwiftUI`, and `Elm`.
+//! Like all of these, it uses lightweight view objects, diffing them to provide
+//! minimal updates to a retained UI. Like `SwiftUI`, it is strongly typed. For more
+//! details on `Xilem`'s reactive architecture see `Xilem`: an [architecture for UI in Rust].
+//!
+//! `Xilem`'s reactive layer is built on top of a wide array of foundational Rust UI projects, e.g.:
+//!
+//! * Widgets are provided by [Masonry], which is a fork of the now discontinued `Druid` UI toolkit.
+//! * Rendering is provided by [Vello], a high performance GPU compute-centric 2D renderer.
+//! * GPU compute infrastructure is provided by wgpu.
+//! * Text support is provided by [Parley], [Fontique], [swash], and [skrifa].
+//! * Accessibility is provided by [AccessKit].
+//! * Window handling is provided by [winit].
+//!
+//! `Xilem` can currently be considered to be in an alpha state. Lots of things need improvements.
+//!
+//! ## Example
+//! The simplest app looks like this:
+//! ```rust,no_run
+//! use winit::error::EventLoopError;
+//! use xilem::view::{button, flex, label};
+//! use xilem::{EventLoop, WidgetView, Xilem};
+//!
+//! #[derive(Default, Debug)]
+//! struct AppState {
+//!     num: i32,
+//! }
+//!
+//! fn app_logic(data: &mut AppState) -> impl WidgetView<AppState> {
+//!     flex((label(format!("{}", data.num)), button("increment", |data: &mut AppState| data.num+=1)))
+//! }
+//!
+//! fn main() -> Result<(), EventLoopError> {
+//!     let app = Xilem::new(AppState::default(), app_logic);
+//!     app.run_windowed(EventLoop::with_user_event(), "Counter".into())?;
+//!     Ok(())
+//! }
+//! ```
+//! More examples available [here](https://github.com/linebender/xilem/tree/main/xilem/examples).
+//!
+//! ## View elements
+//! The primitives your [Xilem] app’s view tree will generally be constructed from:
+//! - [`flex`]: layout defines how items will be arranged in rows or columns.
+//! - [`grid`]: layout divides a window into regions and defines the relationship
+//!   between inner elements in terms of size and position.
+//! - [`lens`]: an adapter which allows using a component which only uses one field
+//!   of the current state.
+//! - [`map action`]: provides a message that the parent view has to handle
+//!   to update the state.
+//! - [`adapt`]: the most flexible but also most verbose way to modularize the views
+//!   by state and action.
+//! - [`sized box`]: forces its child to have a specific width and/or height.
+//! - [`button`]: basic button element.
+//! - [`checkbox`]: an element which can be in checked and unchecked state.
+//! - [`image`]: displays the bitmap `image`.
+//! - [`label`]: a non-interactive text element.
+//! - [`portal`]: a view which puts `child` into a scrollable region.
+//! - [`progress bar`]: progress bar element.
+//! - [`prose`]: displays immutable text which can be selected within.
+//! - [`spinner`]: can be used to display that progress is happening on some process.
+//! - [`task`]: launch a task which will run until the view is no longer in the tree.
+//! - [`textbox`]: The textbox widget displays text which can be edited by the user.
+//! - [`variable label`]: displays non-editable text, with a variable [weight].
+//! - [`zstack`]: an element that lays out its children on top of each other.
+//!
+//! [architecture for UI in Rust]: https://raphlinus.github.io/rust/gui/2022/05/07/ui-architecture.html
+//! [winit]: https://crates.io/crates/winit
+//! [Druid]: https://crates.io/crates/druid
+//! [Xilem]: https://crates.io/crates/xilem
+//! [XilemDocs]: https://docs.rs/xilem
+//! [Masonry]: https://crates.io/crates/masonry
+//! [Vello]: https://crates.io/crates/vello
+//! [Parley]: https://crates.io/crates/parley
+//! [Fontique]: https://crates.io/crates/fontique
+//! [swash]: https://crates.io/crates/swash
+//! [skrifa]: https://crates.io/crates/skrifa
+//! [AccessKit]: https://crates.io/crates/accesskit
+//! [`flex`]: https://docs.rs/xilem/latest/xilem/view/fn.flex.html
+//! [`grid`]: https://docs.rs/xilem/latest/xilem/view/fn.grid.html
+//! [`lens`]: core::lens
+//! [`map state`]: core::map_state
+//! [`map action`]: core::map_action
+//! [`adapt`]: core::adapt
+//! [`sized box`]: https://docs.rs/xilem/latest/xilem/view/fn.sized_box.html
+//! [`button`]: https://docs.rs/xilem/latest/xilem/view/fn.button.html
+//! [`checkbox`]: https://docs.rs/xilem/latest/xilem/view/fn.checkbox.html
+//! [`image`]: https://docs.rs/xilem/latest/xilem/view/fn.image.html
+//! [`label`]: https://docs.rs/xilem/latest/xilem/view/fn.label.html
+//! [`portal`]: https://docs.rs/xilem/latest/xilem/view/fn.portal.html
+//! [`progress bar`]: https://docs.rs/xilem/latest/xilem/view/fn.progress_bar.html
+//! [`prose`]: https://docs.rs/xilem/latest/xilem/view/fn.prose.html
+//! [`spinner`]: https://docs.rs/xilem/latest/xilem/view/fn.spinner.html
+//! [`task`]: https://docs.rs/xilem/latest/xilem/view/fn.task.html
+//! [`textbox`]: https://docs.rs/xilem/latest/xilem/view/fn.textbox.html
+//! [`variable label`]: https://docs.rs/xilem/latest/xilem/view/fn.variable_label.html
+//! [`zstack`]: https://docs.rs/xilem/latest/xilem/view/fn.zstack.html
+//! [weight]: https://docs.rs/parley/latest/parley/style/struct.FontWeight.html
 
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46134943?s=48&v=4")]
 // LINEBENDER LINT SET - lib.rs - v1
 // See https://linebender.org/wiki/canonical-lints/
 // These lints aren't included in Cargo.toml because they
@@ -67,6 +164,7 @@ pub mod view;
 pub use any_view::AnyWidgetView;
 pub use driver::{async_action, MasonryDriver, MasonryProxy, ASYNC_MARKER_WIDGET};
 
+/// Runtime builder.
 #[must_use = "A Xilem app does nothing unless ran."]
 pub struct Xilem<State, Logic> {
     state: State,
@@ -108,6 +206,7 @@ where
     }
 
     // TODO: Make windows a specific view
+    /// Run app with default windows attributes.
     pub fn run_windowed(
         self,
         // We pass in the event loop builder to allow
@@ -129,6 +228,7 @@ where
     }
 
     // TODO: Make windows into a custom view
+    /// Run app with custom windows attributes.
     pub fn run_windowed_in(
         self,
         mut event_loop: EventLoopBuilder,
