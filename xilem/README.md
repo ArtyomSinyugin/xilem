@@ -126,7 +126,7 @@ The primitives your [Xilem] app’s view tree will generally be constructed from
 
 ## Minimum supported Rust Version (MSRV)
 
-This version of Xilem has been verified to compile with **Rust 1.81** and later.
+This version of Xilem has been verified to compile with **Rust 1.82** and later.
 
 Future versions of Xilem might increase the Rust version requirement.
 It will not be treated as a breaking change and as such can even happen with small patch releases.
