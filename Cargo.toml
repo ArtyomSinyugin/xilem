@@ -7,7 +7,7 @@ members = [
     "masonry_core",
     "masonry_testing",
     "masonry_winit",
-
+    "masonry_wayland",
     "xilem_web",
     "xilem_web/web_examples/counter",
     "xilem_web/web_examples/counter_custom_element",
@@ -43,6 +43,7 @@ masonry = { version = "0.3.0", path = "masonry" }
 masonry_core = { version = "0.3.0", path = "masonry_core" }
 masonry_testing = { version = "0.3.0", path = "masonry_testing" }
 masonry_winit = { version = "0.3.0", path = "masonry_winit" }
+masonry_wayland = { version = "0.3.0", path = "masonry_wayland" }
 xilem_core = { version = "0.3.0", path = "xilem_core" }
 tree_arena = { version = "0.1.0", path = "tree_arena" }
 

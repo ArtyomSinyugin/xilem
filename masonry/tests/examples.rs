@@ -12,6 +12,7 @@
 #[path = "../examples"]
 pub mod others {
     pub mod calc_masonry;
+    pub mod calc_wayland;
     pub mod custom_widget;
     pub mod grid_masonry;
     pub mod simple_image;
