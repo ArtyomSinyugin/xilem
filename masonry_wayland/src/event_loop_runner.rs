@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc,
         mpsc::{Receiver, Sender},
@@ -26,14 +26,14 @@ use masonry_core::{
     },
 };
 use smithay_winit::{
-    ApplicationHandler, LoopHandler, WaylandWindow, WindowAttributes, WindowId, WindowImmutable,
+    ApplicationHandler, LoopHandler, WindowAttributes, WindowCore, WindowId as HandleId,
     WindowsRegistry, event_loop::WlEventLoop,
 };
 use tracing::{debug, info};
 
 use crate::{
     AppDriver,
-    app_driver::DriverCtx,
+    app_driver::{DriverCtx, WindowId},
     convert_wayland_types::{logical_to_physical_rounded, masonry_resize_direction_to_wayland},
     vello_util::{RenderContext, RenderSurface},
 };
@@ -100,8 +100,10 @@ impl NewWindow {
 }
 /// Per-Window state
 pub struct Window {
+    pub(crate) window_id: WindowId,
     pub(crate) render_root: RenderRoot,
     pub(crate) base_color: Color,
+    pub(crate) scale_factor: f64,
 }
 
 impl Window {
@@ -115,6 +117,7 @@ impl Window {
         scale_factor: f64,
     ) -> Self {
         Self {
+            window_id,
             render_root: RenderRoot::new(
                 root_widget,
                 move |signal| {
@@ -130,6 +133,7 @@ impl Window {
                 },
             ),
             base_color,
+            scale_factor,
         }
     }
 
@@ -145,6 +149,7 @@ impl Window {
 }
 
 // --- MARK: RUN
+// TODO: somehow we need to run with default windows without attr
 pub fn run(
     new_windows: Vec<NewWindow>,
     app_driver: impl AppDriver + 'static,
@@ -186,14 +191,16 @@ pub struct MasonryState<'a> {
     pub renderer: Option<Renderer>,
     #[cfg(feature = "tracy")]
     frame: Option<tracing_tracy::client::Frame>,
-    surfaces: HashMap<WindowId, RenderSurface<'a>>,
-    pub windows: HashMap<WindowId, Window>,
+    surfaces: HashMap<HandleId, RenderSurface<'a>>,
+    pub windows: HashMap<HandleId, Window>,
+    window_id_to_handle_id: HashMap<WindowId, HandleId>,
     // Is `Some` if the most recently displayed frame was an animation frame.
     pub last_anim: Option<Instant>,
     pub signal_receiver: Receiver<(WindowId, RenderRootSignal)>,
     pub signal_sender: Sender<(WindowId, RenderRootSignal)>,
     pub default_properties: Arc<DefaultProperties>,
     pub clipboard_cx: ClipboardContext,
+    pub(crate) new_windows: VecDeque<NewWindow>,
 }
 
 impl LoopHandler for MasonryState<'_> {}
@@ -210,6 +217,7 @@ impl MasonryState<'_> {
             renderer: None,
             surfaces: HashMap::new(),
             windows: HashMap::new(),
+            window_id_to_handle_id: HashMap::new(),
             last_anim: None,
             #[cfg(feature = "tracy")]
             frame: None,
@@ -217,6 +225,7 @@ impl MasonryState<'_> {
             signal_sender,
             default_properties: Arc::new(default_properties),
             clipboard_cx: ClipboardContext::new().unwrap(),
+            new_windows: VecDeque::new(),
         }
     }
 
@@ -224,13 +233,12 @@ impl MasonryState<'_> {
     fn render(
         surface: &mut RenderSurface<'_>,
         window: &mut Window,
-        handle: &mut WaylandWindow,
+        scale_factor: f64,
         scene: Scene,
         render_cx: &RenderContext,
         renderer: &mut Option<Renderer>,
     ) {
         let size = window.render_root.size();
-        let scale_factor = handle.scale_factor as f64;
 
         let transformed_scene = if scale_factor == 1.0 {
             None
@@ -302,7 +310,7 @@ impl MasonryState<'_> {
                 .create_view(&wgpu::TextureViewDescriptor::default()),
         );
         queue.submit([encoder.finish()]);
-        // TODO: нужно ли это вообще
+        // TODO: do we need it
         // handle.pre_present_notify();
         surface_texture.present();
         {
@@ -312,54 +320,47 @@ impl MasonryState<'_> {
         }
     }
 
-    pub(crate) fn new_windows(&mut self, new_windows: Vec<NewWindow>) -> Result<(), String> {
-        for window in new_windows {
-            // TODO: move this check to modification of base_color once winit exposes window transparency state
-            if !window.attributes.transparent && window.base_color.components[3] != 1. {
-                tracing::warn!(
-                    window_id = ?window.id,
-                    "New window with non-opaque base color doesn't support transparency - \
-                    you should call `.with_transparent(true)` on the new window's `WindowAttributes`."
-                );
+    pub(crate) fn new_windows(&mut self, mut new_windows: Vec<NewWindow>) -> Result<(), String> {
+        for window in new_windows.drain(..) {
+            let id: WindowId = window.id;
+            match self.request_new_window(window.attributes.clone()) {
+                Ok(_) => self.new_windows.push_back(window),
+                Err(err) => {
+                    tracing::error!("Failed to create window with id: {:?}\n{}", id, err);
+                }
             }
-            self.create_windows(vec![(window.id, window.attributes.clone())])?;
-            let scale_factor = self.default_scale_factor() as f64;
-            let size = window
-                .attributes
-                .surface_size
-                .map(|s| s.to_logical(scale_factor))
-                .unwrap_or(self.default_window_size().clone());
-            if self
-                .windows
-                .insert(
-                    window.id,
-                    Window::new(
-                        window.id,
-                        window.root_widget,
-                        self.signal_sender.clone(),
-                        self.default_properties.clone(),
-                        window.base_color,
-                        logical_to_physical_rounded(size, scale_factor),
-                        scale_factor,
-                    ),
-                )
-                .is_some()
-            {
-                panic!(
-                    "attempted to create a window with id {:?} but a window with that id already exists",
-                    window.id
-                );
-            }
-            tracing::debug!(window_id = window.id.trace(), "creating window");
         }
         Ok(())
     }
 
+    pub fn close_window(&mut self, window_id: WindowId) {
+        tracing::debug!(window_id = window_id.trace(), "closing window");
+        let window_id = self
+            .window_id_to_handle_id
+            .remove(&window_id)
+            .unwrap_or_else(|| panic!("could not found find window for id {window_id:?}"));
+        self.surfaces.remove(&window_id);
+        let _window = self.windows.remove(&window_id).unwrap();
+    }
+
+    fn handle_id(&self, window_id: WindowId) -> HandleId {
+        self.window_id_to_handle_id
+            .get(&window_id)
+            .unwrap_or_else(|| panic!("could not find window for id {window_id:?}"))
+            .to_owned()
+    }
+
+    pub(crate) fn window_mut(&mut self, window_id: WindowId) -> &mut Window {
+        let handle_id = self.handle_id(window_id);
+        self.windows.get_mut(&handle_id).unwrap()
+    }
+
     fn handle_signals(&mut self, windows: &mut WindowsRegistry, app_driver: &mut dyn AppDriver) {
-        let mut need_redraw = HashSet::<WindowId>::new();
+        let mut need_redraw = HashSet::<HandleId>::new();
         while let Some((window_id, signal)) = self.signal_receiver.try_iter().next() {
-            let window = self.windows.get_mut(&window_id).unwrap();
-            let handle = windows.get_mut(&window_id).unwrap();
+            let handle_id = self.handle_id(window_id);
+            let window = self.windows.get_mut(&handle_id).unwrap();
+            let handle = windows.get_mut(&handle_id).unwrap();
             match signal {
                 RenderRootSignal::Action(action, widget_id) => {
                     debug!(
@@ -382,11 +383,11 @@ impl MasonryState<'_> {
                     self.clipboard_cx.set_contents(text).unwrap();
                 }
                 RenderRootSignal::RequestRedraw => {
-                    need_redraw.insert(window_id);
+                    need_redraw.insert(handle_id);
                 }
                 RenderRootSignal::RequestAnimFrame => {
                     // TODO
-                    need_redraw.insert(window_id);
+                    need_redraw.insert(handle_id);
                 }
                 RenderRootSignal::TakeFocus => {
                     // Wayland unsuported
@@ -446,16 +447,86 @@ impl MasonryState<'_> {
         }
     }
 
-    fn draw(&mut self, window_id: WindowId, handle: &mut WaylandWindow) {
-        if let Some(window) = self.windows.get_mut(&window_id) {
+    fn handle_locked_signals(
+        &mut self,
+        windows: &mut WindowsRegistry,
+        app_driver: &mut dyn AppDriver,
+    ) {
+        let mut need_redraw = HashSet::<HandleId>::new();
+        while let Some((window_id, signal)) = self.signal_receiver.try_iter().next() {
+            let handle_id = self.handle_id(window_id);
+            let window = self.windows.get_mut(&handle_id).unwrap();
+            let handle = windows.get_locked_mut(&handle_id).unwrap();
+            match signal {
+                RenderRootSignal::Action(action, widget_id) => {
+                    debug!(
+                        "Action {:?} on widget {:?}",
+                        (*action).type_name(),
+                        widget_id
+                    );
+                    app_driver.on_action(window_id, &mut DriverCtx::new(self), widget_id, action);
+                }
+                RenderRootSignal::StartIme => {
+                    // handle.set_ime_allowed(true);
+                }
+                RenderRootSignal::EndIme => {
+                    // handle.set_ime_allowed(false);
+                }
+                RenderRootSignal::ImeMoved(_position, _size) => {
+                    // handle.set_ime_cursor_area(position, size);
+                }
+                RenderRootSignal::ClipboardStore(text) => {
+                    self.clipboard_cx.set_contents(text).unwrap();
+                }
+                RenderRootSignal::RequestRedraw => {
+                    need_redraw.insert(handle_id);
+                }
+                RenderRootSignal::RequestAnimFrame => {
+                    // TODO
+                    need_redraw.insert(handle_id);
+                }
+                RenderRootSignal::SetCursor(cursor) => {
+                    handle.set_cursor(cursor);
+                }
+                RenderRootSignal::Exit => {
+                    self.stop();
+                }
+                RenderRootSignal::WidgetSelectedInInspector(widget_id) => {
+                    let Some(widget) = window.render_root.get_widget(widget_id) else {
+                        return;
+                    };
+                    let widget_name = widget.short_type_name();
+                    let display_name = if let Some(debug_text) = widget.get_debug_text() {
+                        format!("{widget_name}<{debug_text}>")
+                    } else {
+                        widget_name.into()
+                    };
+                    info!("Widget selected in inspector: {widget_id} - {display_name}");
+                }
+                _ => {}
+            }
+        }
+
+        // If we're processing a lot of actions, we may have a lot of pending redraws.
+        // We batch them up to avoid redundant requests.
+        for id in &need_redraw {
+            if let Some(screenlock) = windows.get_locked(id) {
+                screenlock.redraw_request();
+            }
+        }
+    }
+
+    fn draw(&mut self, handle: Arc<WindowCore>, adapter: &mut Adapter) {
+        let id = handle.get_id();
+        if let Some(window) = self.windows.get_mut(&id) {
             let size = window.render_root.size();
             if size.width == 0 || size.height == 0 {
                 // Surface can't have a dimension of zero, remove the stale surface to save memory.
-                self.surfaces.remove(&window_id);
+                self.surfaces.remove(&id);
                 return;
             }
             // Get the existing surface or create a new one
-            let surface = if let Some(surface) = self.surfaces.get_mut(&window_id) {
+            let surface = if let Some(surface) = self.surfaces.get_mut(&id) {
                 // The window might have been resized, make sure the surface dimensions match.
                 if surface.config.width != size.width || surface.config.height != size.height {
                     self.render_cx
@@ -463,9 +534,9 @@ impl MasonryState<'_> {
                 }
                 surface
             } else {
-                let surface = create_surface(&mut self.render_cx, handle.immutable.clone(), size);
-                self.surfaces.insert(window_id.clone(), surface);
-                self.surfaces.get_mut(&window_id).unwrap()
+                let surface = create_surface(&mut self.render_cx, handle.clone(), size);
+                self.surfaces.insert(id.clone(), surface);
+                self.surfaces.get_mut(&id).unwrap()
             };
 
             let now = Instant::now();
@@ -489,7 +560,7 @@ impl MasonryState<'_> {
             Self::render(
                 surface,
                 window,
-                handle,
+                window.scale_factor,
                 scene,
                 &self.render_cx,
                 &mut self.renderer,
@@ -497,26 +568,72 @@ impl MasonryState<'_> {
             #[cfg(feature = "tracy")]
             drop(self.frame.take());
             if let Some(tree_update) = tree_update {
-                handle.accesskit_adapter.update_if_active(|| tree_update);
+                adapter.update_if_active(|| tree_update);
             }
         }
     }
 
     pub fn set_present_mode(&mut self, window_id: WindowId, present_mode: wgpu::PresentMode) {
-        let surface = self.surfaces.get_mut(&window_id).unwrap();
+        let handle_id = self.handle_id(window_id);
+        let surface = self.surfaces.get_mut(&handle_id).unwrap();
         self.render_cx.set_present_mode(surface, present_mode);
     }
 }
 
 impl ApplicationHandler<MasonryUserEvent> for MainState<'_> {
-    fn draw_handle(&mut self, window_id: WindowId, handle: &mut WaylandWindow) {
-        self.masonry_state.draw(window_id, handle);
+    fn create_window(&mut self, new_window: Arc<WindowCore>) {
+        let Some(window) = self.masonry_state.new_windows.pop_front() else {
+            return;
+        };
+        let _ = self
+            .masonry_state
+            .window_id_to_handle_id
+            .insert(window.id, new_window.get_id());
+        // TODO: move this check to modification of base_color once winit exposes window transparency state
+        if !window.attributes.transparent && window.base_color.components[3] != 1. {
+            tracing::warn!(
+                window_id = ?window.id,
+                "New window with non-opaque base color doesn't support transparency - \
+                you should call `.with_transparent(true)` on the new window's `WindowAttributes`."
+            );
+        }
+        let scale_factor = self.masonry_state.default_scale_factor() as f64;
+        let size = window
+            .attributes
+            .surface_size
+            .map(|s| s.to_logical(scale_factor))
+            .unwrap_or(self.masonry_state.default_window_size().clone());
+        if self
+            .masonry_state
+            .windows
+            .insert(
+                new_window.get_id(),
+                Window::new(
+                    window.id,
+                    window.root_widget,
+                    self.masonry_state.signal_sender.clone(),
+                    self.masonry_state.default_properties.clone(),
+                    window.base_color,
+                    logical_to_physical_rounded(size, scale_factor),
+                    scale_factor,
+                ),
+            )
+            .is_some()
+        {
+            panic!(
+                "attempted to create a window with id {:?} but a window with that id already exists",
+                window.id
+            );
+        }
+        tracing::debug!(window_id = window.id.trace(), "creating window");
     }
 
-    fn keyboard_handle(&mut self, window: WindowId, keyboard_event: KeyboardEvent) {
-        if let Some(window) = self.masonry_state.windows.get_mut(&window) {
-            // TODO: возможно состояние фокуса записывается где-то ещё и здесь не нужна seat_state.keyboard_focus
+    fn draw_handle(&mut self, window: Arc<WindowCore>, adapter: &mut Adapter) {
+        self.masonry_state.draw(window, adapter);
+    }
 
+    fn keyboard_handle(&mut self, window: &HandleId, keyboard_event: KeyboardEvent) {
+        if let Some(window) = self.masonry_state.windows.get_mut(&window) {
             // TODO - Detect in Masonry code instead
             let action_mod = keyboard_event.modifiers.ctrl();
             if let Key::Character(c) = &keyboard_event.key
@@ -537,21 +654,22 @@ impl ApplicationHandler<MasonryUserEvent> for MainState<'_> {
         }
     }
 
-    fn pointer_handle(&mut self, window: WindowId, pointer_event: PointerEvent) {
+    fn pointer_handle(&mut self, window: &HandleId, pointer_event: PointerEvent) {
         if let Some(window) = self.masonry_state.windows.get_mut(&window) {
             window.render_root.handle_pointer_event(pointer_event);
         }
     }
 
-    fn rescale_handle(&mut self, window: WindowId, scale_factor: f64) {
+    fn rescale_handle(&mut self, window: &HandleId, scale_factor: f64) {
         if let Some(window) = self.masonry_state.windows.get_mut(&window) {
+            window.scale_factor = scale_factor;
             window
                 .render_root
                 .handle_window_event(WindowEvent::Rescale(scale_factor));
         }
     }
 
-    fn resize_handle(&mut self, window: WindowId, size: PhysicalSize<u32>) {
+    fn resize_handle(&mut self, window: &HandleId, size: PhysicalSize<u32>) {
         if let Some(window) = self.masonry_state.windows.get_mut(&window) {
             window
                 .render_root
@@ -559,7 +677,7 @@ impl ApplicationHandler<MasonryUserEvent> for MainState<'_> {
         }
     }
 
-    fn focus_handle(&mut self, window: WindowId, new_focus: bool) {
+    fn focus_handle(&mut self, window: &HandleId, new_focus: bool) {
         if let Some(window) = self.masonry_state.windows.get_mut(&window) {
             window
                 .render_root
@@ -567,30 +685,36 @@ impl ApplicationHandler<MasonryUserEvent> for MainState<'_> {
         }
     }
 
-    fn accesskit_activate_handle(&self, _window: WindowId, _: &mut Adapter) {}
+    fn accesskit_activate_handle(&self, _window: HandleId, _: &mut Adapter) {}
     fn accesskit_action_handle(
         &self,
-        _window: WindowId,
+        _window: HandleId,
         _action: ActionRequest,
         _adapter: &mut Adapter,
     ) {
     }
-    fn accesskit_deactivate_handle(&self, _window: WindowId, _: &mut Adapter) {}
+    fn accesskit_deactivate_handle(&self, _window: HandleId, _: &mut Adapter) {}
 
-    fn close_handle(&mut self, window: WindowId) {
-        self.masonry_state
+    fn close_handle(&mut self, window_id: &HandleId) {
+        self.masonry_state.surfaces.remove(&window_id);
+        let window = self
+            .masonry_state
             .windows
-            .remove(&window)
-            .expect("Error to delete window from app");
+            .remove(&window_id)
+            .unwrap_or_else(|| panic!("could not found find window for id {window_id:?}"));
+        self.masonry_state
+            .window_id_to_handle_id
+            .remove(&window.window_id);
         if self.masonry_state.windows.is_empty() {
-            // TODO: do some staff before main event loop will be stopped
+            // Do smth before main event loop will be stopped
         }
     }
 
     fn user_events_handle(&mut self, event: MasonryUserEvent) {
         match event {
             MasonryUserEvent::Action(window_id, action, widget_id) => {
-                if let Some(window) = self.masonry_state.windows.get_mut(&window_id) {
+                let handle_id = self.masonry_state.handle_id(window_id);
+                if let Some(window) = self.masonry_state.windows.get_mut(&handle_id) {
                     window
                         .render_root
                         .emit_signal(RenderRootSignal::Action(action, widget_id))
@@ -601,13 +725,26 @@ impl ApplicationHandler<MasonryUserEvent> for MainState<'_> {
 
     fn user_signals_handle(&mut self, windows: &mut WindowsRegistry) {
         let app_driver = self.app_driver.as_mut();
-        self.masonry_state.handle_signals(windows, app_driver);
+        if !self.masonry_state.is_locked() {
+            self.masonry_state.handle_signals(windows, app_driver);
+        } else {
+            self.masonry_state
+                .handle_locked_signals(windows, app_driver);
+        }
+    }
+
+    fn create_screenlock(
+        &mut self,
+        _new_screenlock: std::sync::Weak<WindowCore>,
+        _size: dpi::LogicalSize<u32>,
+    ) {
+        todo!()
     }
 }
 
 fn create_surface<'s>(
     render_cx: &mut RenderContext,
-    handle: Arc<WindowImmutable>,
+    handle: Arc<WindowCore>,
     size: PhysicalSize<u32>,
 ) -> RenderSurface<'s> {
     assert!(

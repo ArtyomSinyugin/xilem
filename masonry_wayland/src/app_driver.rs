@@ -1,12 +1,42 @@
 // Copyright 2024 the Xilem Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use masonry_core::app::RenderRoot;
 use masonry_core::core::{ErasedAction, WidgetId};
-use smithay_winit::{LoopHandler, WindowId};
+use smithay_winit::LoopHandler;
+use tracing::field::DisplayValue;
 
 use crate::event_loop_runner::Window;
 use crate::{MasonryState, NewWindow};
+
+/// A unique and persistent identifier for a window.
+///
+/// [`MasonryState`] internally maps these to winit window ids ([`winit::window::WindowId`]).
+/// Applications should only use this struct and not be concerned with the winit window ids.
+/// When the application is suspended and resumed this id will stay the same, while the
+/// winit window id will change.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct WindowId(pub(crate) NonZeroU64);
+
+impl WindowId {
+    /// Allocate a new, unique `WindowId`.
+    ///
+    /// You must ensure that a given `WindowId` is only ever used for one
+    /// window at a time.
+    pub fn next() -> Self {
+        static WINDOW_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+        let id = WINDOW_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(id.try_into().unwrap())
+    }
+
+    /// A serialized representation of the `WindowId` for debugging purposes.
+    pub fn trace(self) -> DisplayValue<NonZeroU64> {
+        tracing::field::display(self.0)
+    }
+}
 
 /// Context for the [`AppDriver`] trait.
 pub struct DriverCtx<'a, 's> {
@@ -62,11 +92,8 @@ impl DriverCtx<'_, '_> {
     /// # Panics
     ///
     /// Panics if the window cannot be found.
-    pub fn render_root(&mut self, window_id: WindowId) -> Option<&mut RenderRoot> {
-        match self.state.windows.get_mut(&window_id) {
-            Some(window) => Some(&mut window.render_root),
-            None => None,
-        }
+    pub fn render_root(&mut self, window_id: WindowId) -> &mut RenderRoot {
+        &mut self.window(window_id).render_root
     }
 
     /// Access the [`Window`] state of the given window.
@@ -74,8 +101,8 @@ impl DriverCtx<'_, '_> {
     /// # Panics
     ///
     /// Panics if the window cannot be found.
-    pub fn window(&mut self, window_id: WindowId) -> Option<&mut Window> {
-        self.state.windows.get_mut(&window_id)
+    pub fn window(&mut self, window_id: WindowId) -> &mut Window {
+        self.state.window_mut(window_id)
     }
 
     /// Creates a new window.
@@ -93,7 +120,21 @@ impl DriverCtx<'_, '_> {
     ///
     /// Panics if the window cannot be found.
     pub fn close_window(&mut self, window_id: WindowId) {
-        let _w = self.state.windows.remove(&window_id).unwrap();
+        self.state.close_window(window_id);
+    }
+
+    // TODO: write description
+    pub fn lock_screen(&self) -> Result<(), String> {
+        self.state.screenlock()
+    }
+
+    // TODO: write description
+    pub fn is_locked(&self) -> bool {
+        self.state.is_locked()
+    }
+
+    pub fn unlock_screen(&self) {
+        self.state.unlock()
     }
 
     /// Exits the application (stops the event loop).

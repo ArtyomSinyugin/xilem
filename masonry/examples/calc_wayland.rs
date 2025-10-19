@@ -25,9 +25,9 @@ use masonry::properties::{
 };
 use masonry::theme::default_property_set;
 use masonry::widgets::{Button, ButtonPress, Flex, Grid, GridParams, Label};
-use masonry_wayland::NewWindow;
-use masonry_wayland::smithay_winit::{WaylandWindow, WindowId};
+use masonry_wayland::smithay_winit::WaylandWindow;
 use masonry_wayland::{AppDriver, DriverCtx, run};
+use masonry_wayland::{NewWindow, WindowId};
 
 #[derive(Clone)]
 struct CalcState {
@@ -68,8 +68,10 @@ impl CalcState {
             self.value.clear();
             self.in_num = true;
         }
-        let ch = (b'0' + digit) as char;
-        self.value.push(ch);
+        if self.value != "0".to_string() {
+            let ch = (b'0' + digit) as char;
+            self.value.push(ch);
+        }
     }
 
     fn display(&mut self) {
@@ -156,7 +158,7 @@ impl AppDriver for CalcState {
     ) {
         debug_assert_eq!(window_id, self.window_id, "unknown window");
 
-        let Some(source) = ctx.render_root(window_id).unwrap().get_widget(widget_id) else {
+        let Some(source) = ctx.render_root(window_id).get_widget(widget_id) else {
             return;
         };
         let Some(button) = source.downcast::<Button>() else {
@@ -172,16 +174,14 @@ impl AppDriver for CalcState {
             CalcAction::None => (),
         }
 
-        ctx.render_root(window_id)
-            .unwrap()
-            .edit_root_widget(|mut root| {
-                let mut grid = root.downcast();
-                let mut flex = Grid::child_mut(&mut grid, 0);
-                let mut flex = flex.downcast();
-                let mut label = Flex::child_mut(&mut flex, 1).unwrap();
-                let mut label = label.downcast::<Label>();
-                Label::set_text(&mut label, &*self.value);
-            });
+        ctx.render_root(window_id).edit_root_widget(|mut root| {
+            let mut grid = root.downcast();
+            let mut flex = Grid::child_mut(&mut grid, 0);
+            let mut flex = flex.downcast();
+            let mut label = Flex::child_mut(&mut flex, 1).unwrap();
+            let mut label = label.downcast::<Label>();
+            Label::set_text(&mut label, &*self.value);
+        });
     }
 }
 
@@ -288,11 +288,13 @@ pub fn build_calc() -> NewWidget<impl Widget> {
 }
 
 fn main() {
-    let window_size = LogicalSize::new(223., 300.);
+    let window_size = LogicalSize::new(250., 300.);
 
     let window_attributes = WaylandWindow::default_attributes()
         .with_title("Simple Wayland Calculator")
         .with_size(window_size)
+        // .with_fullscreen(true)
+        .with_min_surface_size(window_size)
         .with_resizable(true);
 
     let window_id = WindowId::next();
